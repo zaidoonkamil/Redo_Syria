@@ -277,8 +277,18 @@ router.post("/resend-otp", async (req, res) => {
 });
 
 const normalizePhone = (phone = "") => {
-  phone = String(phone).trim();
-  if (phone.startsWith("0")) return "964" + phone.slice(1);
+  phone = String(phone).trim().replace(/[^\d+]/g, "");
+
+  if (phone.startsWith("+")) phone = phone.slice(1);
+  if (phone.startsWith("00")) phone = phone.slice(2);
+
+  if (!phone.startsWith("963") && !phone.startsWith("964")) {
+    if (phone.startsWith("09")) return "963" + phone.slice(1);
+    if (phone.startsWith("07")) return "964" + phone.slice(1);
+    if (phone.startsWith("9") && phone.length === 9) return "963" + phone;
+    if (phone.startsWith("7") && phone.length === 10) return "964" + phone;
+  }
+
   return phone;
 };
 

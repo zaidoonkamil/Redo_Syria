@@ -1,17 +1,34 @@
 const path = require("path");
 const fs = require("fs");
 const qrcode = require("qrcode");
-const { Client, LocalAuth } = require("whatsapp-web.js");
+const P = require("pino");
+const {
+  DisconnectReason,
+  Browsers,
+  default: makeWASocket,
+  fetchLatestBaileysVersion,
+  useMultiFileAuthState,
+} = require("@whiskeysockets/baileys");
 
 const SESSION_PATH = process.env.WHATSAPP_SESSION_PATH
   ? path.resolve(process.env.WHATSAPP_SESSION_PATH)
-  : path.join(__dirname, "..", ".wwebjs_auth");
+  : path.join(__dirname, "..", ".baileys_auth");
 const CLIENT_ID = process.env.WHATSAPP_CLIENT_ID || "rido";
-const AUTO_INIT = process.env.WHATSAPP_AUTO_INIT === "true";
-const RECONNECT_DELAY_MS = Number(process.env.WHATSAPP_RECONNECT_DELAY_MS || 15000);
-const MAX_RECONNECT_DELAY_MS = Number(process.env.WHATSAPP_MAX_RECONNECT_DELAY_MS || 120000);
+const SESSION_DIR = path.join(SESSION_PATH, CLIENT_ID);
+const AUTO_INIT = process.env.WHATSAPP_AUTO_INIT !== "false";
+const RECONNECT_DELAY_MS = Number(
+  process.env.WHATSAPP_RECONNECT_DELAY_MS || 15000
+);
+const MAX_RECONNECT_DELAY_MS = Number(
+  process.env.WHATSAPP_MAX_RECONNECT_DELAY_MS || 120000
+);
+const READY_WAIT_TIMEOUT_MS = Number(
+  process.env.WHATSAPP_READY_WAIT_TIMEOUT_MS || 20000
+);
 
-let client = null;
+let socket = null;
+let authState = null;
+let saveCreds = null;
 let initializingPromise = null;
 let latestQrText = null;
 let latestQrImage = null;
@@ -23,53 +40,8 @@ let reconnectTimer = null;
 let reconnectAttempts = 0;
 let manualLogout = false;
 
-function resetRuntimeState() {
-  latestQrText = null;
-  latestQrImage = null;
-  connectedNumber = null;
-  authenticated = false;
-}
-
-function dropClientReference(reason = "client_reset") {
-  latestError = reason;
-  connectionStatus = "disconnected";
-  client = null;
-  initializingPromise = null;
-  resetRuntimeState();
-}
-
-function isRecoverableSessionError(error) {
-  const message = String(error?.message || error || "").toLowerCase();
-
-  return (
-    message.includes("detached frame") ||
-    message.includes("execution context was destroyed") ||
-    message.includes("cannot find context with specified id") ||
-    message.includes("target closed") ||
-    message.includes("session closed") ||
-    message.includes("protocol error")
-  );
-}
-
-async function destroyClientSilently(instance) {
-  if (!instance) return;
-
-  try {
-    await instance.destroy();
-  } catch (_) {
-  }
-}
-
-async function recoverClientFromRuntimeError(error) {
-  const failingClient = client;
-  clearReconnectTimer();
-  dropClientReference(error?.message || "recoverable_runtime_error");
-  await destroyClientSilently(failingClient);
-  return initWhatsAppClient();
-}
-
 function ensureSessionPath() {
-  fs.mkdirSync(SESSION_PATH, { recursive: true });
+  fs.mkdirSync(SESSION_DIR, { recursive: true });
 }
 
 function clearReconnectTimer() {
@@ -84,12 +56,36 @@ function getReconnectDelay() {
   return Math.min(delay, MAX_RECONNECT_DELAY_MS);
 }
 
+function removeDirectoryIfExists(dirPath) {
+  try {
+    if (fs.existsSync(dirPath)) {
+      fs.rmSync(dirPath, { recursive: true, force: true });
+    }
+  } catch (_) {}
+}
+
+function clearStaleWhatsAppSession() {
+  removeDirectoryIfExists(SESSION_DIR);
+}
+
+function normalizeDisconnectReason(error) {
+  return (
+    error?.output?.statusCode ||
+    error?.statusCode ||
+    error?.data?.statusCode ||
+    null
+  );
+}
+
+function shouldReconnect(error) {
+  return normalizeDisconnectReason(error) !== DisconnectReason.loggedOut;
+}
+
 function scheduleReconnect(reason = "unknown") {
-  if (!AUTO_INIT || manualLogout || initializingPromise || client) {
+  if (!AUTO_INIT || manualLogout || initializingPromise || reconnectTimer) {
     return;
   }
 
-  clearReconnectTimer();
   reconnectAttempts += 1;
   const delay = getReconnectDelay();
   connectionStatus = "reconnecting";
@@ -117,7 +113,12 @@ function normalizeWhatsAppPhone(phone = "") {
 
   if (value.startsWith("+")) value = value.slice(1);
   if (value.startsWith("00")) value = value.slice(2);
-  if (value.startsWith("0")) value = `964${value.slice(1)}`;
+  if (!value.startsWith("963") && !value.startsWith("964")) {
+    if (value.startsWith("09")) value = `963${value.slice(1)}`;
+    if (value.startsWith("07")) value = `964${value.slice(1)}`;
+    if (value.startsWith("9") && value.length === 9) value = `963${value}`;
+    if (value.startsWith("7") && value.length === 10) value = `964${value}`;
+  }
 
   if (!/^\d{8,15}$/.test(value)) {
     throw new Error("Phone number format is invalid");
@@ -136,68 +137,126 @@ function getStatus() {
   };
 }
 
+function waitForClientReady(timeoutMs = READY_WAIT_TIMEOUT_MS) {
+  if (socket && connectionStatus === "ready") {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
+
+    const timer = setInterval(() => {
+      if (socket && connectionStatus === "ready") {
+        clearInterval(timer);
+        resolve();
+        return;
+      }
+
+      if (Date.now() - startedAt >= timeoutMs) {
+        clearInterval(timer);
+        reject(
+          new Error(
+            "WhatsApp client is not ready yet. Wait a few seconds and try again."
+          )
+        );
+      }
+    }, 500);
+  });
+}
+
 async function buildQrImage(qrText) {
   latestQrText = qrText;
   latestQrImage = await qrcode.toDataURL(qrText);
 }
 
-function bindClientEvents(instance) {
-  instance.on("qr", async (qrText) => {
-    clearReconnectTimer();
-    connectionStatus = "qr_ready";
-    latestError = null;
-    connectedNumber = null;
-    authenticated = false;
+function bindSocketEvents(instance) {
+  instance.ev.on("creds.update", saveCreds);
 
-    try {
-      await buildQrImage(qrText);
-    } catch (error) {
-      latestError = `QR generation failed: ${error.message}`;
-    }
-  });
+  instance.ev.on("connection.update", async (update) => {
+    const { connection, lastDisconnect, qr } = update;
 
-  instance.on("authenticated", () => {
-    clearReconnectTimer();
-    reconnectAttempts = 0;
-    authenticated = true;
-    latestError = null;
-    connectionStatus = "authenticated";
-  });
-
-  instance.on("ready", async () => {
-    clearReconnectTimer();
-    reconnectAttempts = 0;
-    connectionStatus = "ready";
-    latestQrText = null;
-    latestQrImage = null;
-    latestError = null;
-
-    try {
-      const wid = instance.info?.wid?._serialized || "";
-      connectedNumber = wid.replace("@c.us", "") || null;
-    } catch (_) {
+    if (qr) {
+      clearReconnectTimer();
+      connectionStatus = "qr_ready";
+      latestError = null;
       connectedNumber = null;
+      authenticated = false;
+
+      try {
+        await buildQrImage(qr);
+      } catch (error) {
+        latestError = `QR generation failed: ${error.message}`;
+      }
     }
-  });
 
-  instance.on("auth_failure", (message) => {
-    clearReconnectTimer();
-    authenticated = false;
-    connectionStatus = "auth_failure";
-    latestError = message || "Authentication failed";
-  });
+    if (connection === "connecting") {
+      connectionStatus = "connecting";
+      latestError = null;
+    }
 
-  instance.on("disconnected", (reason) => {
-    dropClientReference(reason || "Client disconnected");
+    if (connection === "open") {
+      clearReconnectTimer();
+      reconnectAttempts = 0;
+      connectionStatus = "ready";
+      authenticated = true;
+      latestQrText = null;
+      latestQrImage = null;
+      latestError = null;
 
-    if (!manualLogout) {
-      scheduleReconnect(reason || "Client disconnected");
+      try {
+        connectedNumber = instance.user?.id?.split(":")[0] || null;
+      } catch (_) {
+        connectedNumber = null;
+      }
+    }
+
+    if (connection === "close") {
+      authenticated = false;
+      socket = null;
+      initializingPromise = null;
+      latestQrText = null;
+      latestQrImage = null;
+      connectedNumber = null;
+
+      const error = lastDisconnect?.error;
+      const reasonCode = normalizeDisconnectReason(error);
+      const reason = error?.message || `disconnect:${reasonCode || "unknown"}`;
+      latestError = reason;
+
+      if (shouldReconnect(error) && !manualLogout) {
+        connectionStatus = "disconnected";
+        scheduleReconnect(reason);
+      } else {
+        connectionStatus = "logged_out";
+        clearStaleWhatsAppSession();
+      }
     }
   });
 }
 
+async function buildSocket() {
+  ensureSessionPath();
+  const auth = await useMultiFileAuthState(SESSION_DIR);
+  authState = auth.state;
+  saveCreds = auth.saveCreds;
+
+  const { version } = await fetchLatestBaileysVersion();
+  const instance = makeWASocket({
+    version,
+    auth: authState,
+    printQRInTerminal: false,
+    browser: Browsers.macOS("Rido"),
+    logger: P({ level: process.env.WHATSAPP_LOG_LEVEL || "silent" }),
+    markOnlineOnConnect: false,
+    syncFullHistory: false,
+  });
+
+  bindSocketEvents(instance);
+  return instance;
+}
+
 async function initWhatsAppClient() {
-  if (client) {
+  if (socket) {
     return getStatus();
   }
 
@@ -210,27 +269,17 @@ async function initWhatsAppClient() {
   latestError = null;
   manualLogout = false;
   clearReconnectTimer();
-  ensureSessionPath();
 
-  client = new Client({
-    authStrategy: new LocalAuth({
-      clientId: CLIENT_ID,
-      dataPath: SESSION_PATH,
-    }),
-    puppeteer: {
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    },
-  });
-
-  bindClientEvents(client);
-
-  initializingPromise = client.initialize()
+  initializingPromise = buildSocket()
+    .then((instance) => {
+      socket = instance;
+      return getStatus();
+    })
     .catch((error) => {
-      latestError = error.message;
+      latestError = error.message || String(error);
       connectionStatus = "failed";
-      client = null;
-      scheduleReconnect(error.message);
+      socket = null;
+      scheduleReconnect(latestError);
       throw error;
     })
     .finally(() => {
@@ -241,13 +290,52 @@ async function initWhatsAppClient() {
   return getStatus();
 }
 
-function ensureClientReady() {
-  if (!client || connectionStatus !== "ready") {
-    throw new Error("WhatsApp client is not ready. Scan QR and wait until status becomes ready.");
+async function ensureClientReady() {
+  if (!socket && AUTO_INIT && !initializingPromise) {
+    try {
+      await initWhatsAppClient();
+    } catch (_) {}
+  }
+
+  if (socket && connectionStatus === "ready") {
+    return;
+  }
+
+  await waitForClientReady();
+
+  if (!socket || connectionStatus !== "ready") {
+    throw new Error(
+      "WhatsApp client is not ready yet. Wait a few seconds and try again."
+    );
+  }
+}
+
+async function ensureWhatsAppReady() {
+  try {
+    await ensureClientReady();
+    return getStatus();
+  } catch (error) {
+    if (connectionStatus === "qr_ready") {
+      throw new Error(
+        "WhatsApp is not connected yet. Please scan the QR code from admin settings first."
+      );
+    }
+
+    if (connectionStatus === "logged_out") {
+      throw new Error(
+        "WhatsApp is logged out. Please reconnect WhatsApp from admin settings."
+      );
+    }
+
+    throw error;
   }
 }
 
 async function getQrCode() {
+  if (!socket && !initializingPromise) {
+    await initWhatsAppClient();
+  }
+
   return {
     status: connectionStatus,
     qrText: latestQrText,
@@ -259,27 +347,26 @@ async function logoutWhatsApp() {
   manualLogout = true;
   clearReconnectTimer();
 
-  if (!client) {
-    connectionStatus = "idle";
-    resetRuntimeState();
-    return { success: true, status: connectionStatus };
+  if (socket) {
+    try {
+      await socket.logout();
+    } catch (_) {}
+    try {
+      socket.end?.();
+    } catch (_) {}
   }
 
-  try {
-    await client.logout();
-  } catch (_) {
-  }
-
-  try {
-    await client.destroy();
-  } catch (_) {
-  }
-
-  client = null;
+  socket = null;
   initializingPromise = null;
+  authState = null;
+  saveCreds = null;
+  latestQrText = null;
+  latestQrImage = null;
   latestError = null;
   connectionStatus = "idle";
-  resetRuntimeState();
+  authenticated = false;
+  connectedNumber = null;
+  clearStaleWhatsAppSession();
 
   return { success: true, status: connectionStatus };
 }
@@ -293,18 +380,19 @@ function startWhatsAppAutoInit() {
 }
 
 async function resolveChatId(phone) {
-  ensureClientReady();
+  await ensureClientReady();
 
   const normalizedPhone = normalizeWhatsAppPhone(phone);
-  const numberId = await client.getNumberId(normalizedPhone);
+  const jid = `${normalizedPhone}@s.whatsapp.net`;
+  const exists = await socket.onWhatsApp(jid);
 
-  if (!numberId?._serialized) {
+  if (!exists?.[0]?.exists) {
     throw new Error("This number does not appear to have WhatsApp");
   }
 
   return {
     phone: normalizedPhone,
-    chatId: numberId._serialized,
+    chatId: exists[0].jid || jid,
   };
 }
 
@@ -313,37 +401,21 @@ async function sendWhatsAppText(phone, message) {
     throw new Error("Message is required");
   }
 
-  try {
-    const { phone: normalizedPhone, chatId } = await resolveChatId(phone);
-    const sentMessage = await client.sendMessage(chatId, String(message).trim());
+  const { phone: normalizedPhone, chatId } = await resolveChatId(phone);
+  const sentMessage = await socket.sendMessage(chatId, {
+    text: String(message).trim(),
+  });
 
-    return {
-      to: normalizedPhone,
-      messageId: sentMessage?.id?._serialized || null,
-      timestamp: sentMessage?.timestamp || null,
-      status: "sent",
-    };
-  } catch (error) {
-    if (!isRecoverableSessionError(error)) {
-      throw error;
-    }
-
-    latestError = `Recovered from runtime error: ${error.message || error}`;
-    await recoverClientFromRuntimeError(error);
-
-    const { phone: normalizedPhone, chatId } = await resolveChatId(phone);
-    const sentMessage = await client.sendMessage(chatId, String(message).trim());
-
-    return {
-      to: normalizedPhone,
-      messageId: sentMessage?.id?._serialized || null,
-      timestamp: sentMessage?.timestamp || null,
-      status: "sent_after_recovery",
-    };
-  }
+  return {
+    to: normalizedPhone,
+    messageId: sentMessage?.key?.id || null,
+    timestamp: sentMessage?.messageTimestamp || null,
+    status: "sent",
+  };
 }
 
 module.exports = {
+  ensureWhatsAppReady,
   getQrCode,
   getStatus,
   initWhatsAppClient,
@@ -352,4 +424,3 @@ module.exports = {
   sendWhatsAppText,
   startWhatsAppAutoInit,
 };
-
