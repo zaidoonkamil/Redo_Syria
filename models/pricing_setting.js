@@ -9,6 +9,7 @@ const PricingSetting = sequelize.define(
     pricePerKm: { type: DataTypes.DECIMAL(10, 3), allowNull: false, defaultValue: 0 },
     pricePerMinute: { type: DataTypes.DECIMAL(10, 3), allowNull: true, defaultValue: null },
     minimumFare: { type: DataTypes.DECIMAL(10, 2), allowNull: true, defaultValue: null },
+    roundingTo: { type: DataTypes.DECIMAL(10, 2), allowNull: true, defaultValue: 5 },
     surgeEnabled: { type: DataTypes.BOOLEAN, allowNull: true, defaultValue: false },
     serviceType: {
       type: DataTypes.ENUM("normal", "vip"),

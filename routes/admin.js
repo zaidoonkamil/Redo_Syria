@@ -1,12 +1,14 @@
 const express = require("express");
 const router = express.Router();
 const { requireAdmin } = require("./user");
-const { PricingSetting, PricingTier, RideRequest, User, WalletTransaction } = require("../models");
+const { PricingSetting, PricingTier, RideRequest, User, WalletTransaction, RechargeCode } = require("../models");
 const { Op } = require("sequelize");
+const crypto = require("crypto");
 const redisService = require("../services/redis");
 const socketService = require("../services/socket");
 const notifications = require("../services/notifications");
 const sequelize = require("../config/db");
+const { DEFAULT_PRICING } = require("../services/fareCalculator");
 
 // ─── Wallet helpers (mirrored from user.js) ────────────────────────────────
 const parseAmountToCents = (value) => {
@@ -16,12 +18,26 @@ const parseAmountToCents = (value) => {
   return cents > 0 ? cents : null;
 };
 const centsToDecimal = (cents) => (cents / 100).toFixed(2);
+const normalizeRechargeCode = (value) => String(value || "").replace(/[\s-]+/g, "").toUpperCase();
+const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+const makeRechargeCode = (length = 12, prefix = "") => {
+  const safeLength = Math.min(Math.max(parseInt(length, 10) || 12, 8), 32);
+  const bytes = crypto.randomBytes(safeLength);
+  let body = "";
+  for (let i = 0; i < safeLength; i += 1) {
+    body += CODE_ALPHABET[bytes[i] % CODE_ALPHABET.length];
+  }
+  const cleanPrefix = normalizeRechargeCode(prefix).slice(0, 12);
+  return `${cleanPrefix}${body}`;
+};
 
 const applyWalletTx = async ({ userId, type, amountCents, reference, note, metadata, createdBy }) => {
   if (!["credit", "debit"].includes(type)) throw new Error("invalid_wallet_transaction_type");
   return sequelize.transaction(async (t) => {
     const user = await User.findByPk(userId, { transaction: t, lock: t.LOCK.UPDATE });
     if (!user) { const e = new Error("wallet_user_not_found"); e.code = "wallet_user_not_found"; throw e; }
+    if (user.role !== "driver") { const e = new Error("driver_wallet_only"); e.code = "driver_wallet_only"; throw e; }
     const beforeCents = Math.round(Number(user.walletBalance || 0) * 100);
     const afterCents = beforeCents + (type === "credit" ? amountCents : -amountCents);
     if (afterCents < 0) { const e = new Error("wallet_insufficient_balance"); e.code = "wallet_insufficient_balance"; throw e; }
@@ -114,7 +130,20 @@ router.get("/admin/pricing", requireAdmin, async (req, res) => {
       order: [["createdAt", "DESC"]],
     });
 
-    if (!pricing) return res.json({ pricing: null });
+    if (!pricing) {
+      return res.json({
+        pricing: {
+          id: null,
+          serviceType,
+          ...(DEFAULT_PRICING[serviceType] || DEFAULT_PRICING.normal),
+          surgeEnabled: false,
+          surgeMultiplier: 1,
+          updatedByAdminId: null,
+          createdAt: null,
+          updatedAt: null,
+        },
+      });
+    }
     res.json({ pricing });
   } catch (e) {
     console.error(e.message);
@@ -131,6 +160,7 @@ router.put("/admin/pricing", requireAdmin, async (req, res) => {
       pricePerKm,
       pricePerMinute,
       minimumFare,
+      roundingTo,
       surgeEnabled,
       surgeMultiplier
     } = req.body;
@@ -149,6 +179,7 @@ router.put("/admin/pricing", requireAdmin, async (req, res) => {
       pricePerKm,
       pricePerMinute: pricePerMinute != null ? pricePerMinute : null,
       minimumFare: minimumFare != null ? minimumFare : null,
+      roundingTo: roundingTo != null ? roundingTo : 5,
       surgeEnabled: !!surgeEnabled,
       surgeMultiplier: surgeMultiplier != null ? surgeMultiplier : 1,
       updatedByAdminId: req.user.id,
@@ -338,6 +369,123 @@ router.get("/admin/stats/summary", requireAdmin, async (req, res) => {
 
 // ─── Admin Wallet Management ────────────────────────────────────────────────
 
+// Admin: create driver wallet recharge codes.
+router.post("/admin/recharge-codes", requireAdmin, async (req, res) => {
+  try {
+    const amountCents = parseAmountToCents(req.body.amount);
+    const count = Math.min(Math.max(parseInt(req.body.count || "1", 10), 1), 500);
+    const note = req.body.note ? String(req.body.note).trim().slice(0, 255) : null;
+    const prefix = req.body.prefix || "R";
+    const codeLength = req.body.codeLength || 12;
+
+    if (!amountCents) {
+      return res.status(400).json({ error: "amount must be greater than 0" });
+    }
+
+    const codes = [];
+    const usedInBatch = new Set();
+
+    for (let i = 0; i < count; i += 1) {
+      let rec = null;
+      for (let attempt = 0; attempt < 25 && !rec; attempt += 1) {
+        const code = makeRechargeCode(codeLength, prefix);
+        if (usedInBatch.has(code)) continue;
+
+        const existing = await RechargeCode.findOne({ where: { code } });
+        if (existing) continue;
+
+        try {
+          rec = await RechargeCode.create({
+            code,
+            amount: centsToDecimal(amountCents),
+            status: "active",
+            createdByAdminId: req.user.id,
+            note,
+          });
+          usedInBatch.add(code);
+        } catch (err) {
+          if (err.name !== "SequelizeUniqueConstraintError") throw err;
+        }
+      }
+
+      if (!rec) {
+        return res.status(409).json({ error: "could_not_generate_unique_code" });
+      }
+      codes.push(rec);
+    }
+
+    return res.status(201).json({ success: true, codes });
+  } catch (err) {
+    console.error("Error creating recharge codes:", err);
+    return res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+// Admin: list recharge codes.
+router.get("/admin/recharge-codes", requireAdmin, async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page || "1", 10), 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit || "50", 10), 1), 200);
+    const offset = (page - 1) * limit;
+    const where = {};
+
+    if (req.query.status) {
+      if (!["active", "redeemed", "cancelled"].includes(req.query.status)) {
+        return res.status(400).json({ error: "invalid status" });
+      }
+      where.status = req.query.status;
+    }
+
+    const q = normalizeRechargeCode(req.query.q);
+    if (q) where.code = { [Op.like]: `%${q}%` };
+
+    const { count, rows } = await RechargeCode.findAndCountAll({
+      where,
+      limit,
+      offset,
+      order: [["createdAt", "DESC"]],
+      include: [
+        { model: User, as: "redeemedByDriver", attributes: ["id", "name", "phone", "role"], required: false },
+        { model: User, as: "creator", attributes: ["id", "name", "phone", "role"], required: false },
+      ],
+    });
+
+    return res.json({
+      codes: rows,
+      pagination: {
+        total: count,
+        currentPage: page,
+        totalPages: Math.ceil(count / limit),
+        limit,
+      },
+    });
+  } catch (err) {
+    console.error("Error listing recharge codes:", err);
+    return res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+// Admin: cancel an unused recharge code.
+router.patch("/admin/recharge-codes/:id/cancel", requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: "invalid id" });
+
+    const code = await RechargeCode.findByPk(id);
+    if (!code) return res.status(404).json({ error: "not_found" });
+    if (code.status !== "active") {
+      return res.status(400).json({ error: "code_not_active" });
+    }
+
+    code.status = "cancelled";
+    await code.save();
+    return res.json({ success: true, code });
+  } catch (err) {
+    console.error("Error cancelling recharge code:", err);
+    return res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
 // GET /admin/users/:id/wallet
 // عرض رصيد المحفظة لمستخدم معين (أدمن فقط)
 router.get("/admin/users/:id/wallet", requireAdmin, async (req, res) => {
@@ -425,6 +573,7 @@ router.get("/admin/users/:id/wallet/transactions", requireAdmin, async (req, res
 // شحن محفظة مستخدم (أدمن فقط)
 router.post("/admin/users/:id/wallet/credit", requireAdmin, async (req, res) => {
   try {
+    return res.status(410).json({ error: "use_recharge_codes" });
     const userId = Number(req.params.id);
     if (!Number.isInteger(userId) || userId <= 0) {
       return res.status(400).json({ error: "معرّف المستخدم غير صحيح" });

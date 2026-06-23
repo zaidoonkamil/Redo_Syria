@@ -15,9 +15,8 @@ const applyDriverWalletTx = async ({ userId, type, amountCents, note, metadata, 
     if (!driver) throw Object.assign(new Error("driver_not_found"), { code: "driver_not_found" });
 
     const beforeCents = Math.round(Number(driver.walletBalance || 0) * 100);
-    const afterCents = beforeCents + (type === "credit" ? amountCents : -amountCents);
-
-    if (afterCents < 0) throw Object.assign(new Error("wallet_insufficient_balance"), { code: "wallet_insufficient_balance" });
+    const debitCents = type === "debit" ? Math.min(amountCents, beforeCents) : amountCents;
+    const afterCents = beforeCents + (type === "credit" ? amountCents : -debitCents);
 
     driver.walletBalance = centsToDecimal(afterCents);
     await driver.save({ transaction: t });
@@ -25,7 +24,7 @@ const applyDriverWalletTx = async ({ userId, type, amountCents, note, metadata, 
     await WalletTransaction.create({
       user_id: driver.id,
       type,
-      amount: centsToDecimal(amountCents),
+      amount: centsToDecimal(debitCents),
       balance_before: centsToDecimal(beforeCents),
       balance_after: centsToDecimal(afterCents),
       reference: rideRequestId ? `ride:${rideRequestId}` : null,
@@ -333,7 +332,7 @@ const init = async (io) => {
           if (["completed", "cancelled"].includes(req.status)) return;
 
           // التحقق من المدخلات
-          const method = ["cash", "online"].includes(paymentMethod) ? paymentMethod : "cash";
+          const method = "cash";
           const fare = parseFloat(finalFare) || parseFloat(req.estimatedFare) || 0;
 
           // احتساب العمولة

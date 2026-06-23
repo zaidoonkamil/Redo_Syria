@@ -1,6 +1,8 @@
 require('dotenv').config();
 const express = require("express");
 const sequelize = require("./config/db");
+const { PricingSetting, SystemSetting } = require("./models");
+const { DEFAULT_PRICING } = require("./services/fareCalculator");
 
 const usersRouter = require("./routes/user");
 const notificationsRouter = require("./routes/notifications.js");
@@ -48,6 +50,29 @@ const io = new Server(server, {
   }
 });
 
+async function ensureSyriaPricingDefaults() {
+  const key = "SYP_PRICING_DEFAULTS_APPLIED_V1";
+  const applied = await SystemSetting.findOne({ where: { key } });
+  if (applied) return;
+
+  for (const serviceType of ["normal", "vip"]) {
+    const defaults = DEFAULT_PRICING[serviceType] || DEFAULT_PRICING.normal;
+    await PricingSetting.create({
+      serviceType,
+      baseFare: defaults.baseFare,
+      pricePerKm: defaults.pricePerKm,
+      pricePerMinute: defaults.pricePerMinute,
+      minimumFare: defaults.minimumFare,
+      roundingTo: defaults.roundingTo,
+      surgeEnabled: false,
+      surgeMultiplier: 1,
+      updatedByAdminId: null,
+    });
+  }
+
+  await SystemSetting.create({ key, value: "true" });
+}
+
 (async () => {
   try {
     await redisService.init();
@@ -58,6 +83,8 @@ const io = new Server(server, {
     try { await sequelize.query("ALTER TABLE `RideRequests` ADD COLUMN `paymentMethod` ENUM('cash','online') NULL DEFAULT 'cash';"); } catch (e) {}
 
     await sequelize.sync({ force: false });
+    try { await sequelize.query("ALTER TABLE `pricing_settings` ADD COLUMN `roundingTo` DECIMAL(10,2) NULL DEFAULT 5;"); } catch (e) {}
+    await ensureSyriaPricingDefaults();
     startWhatsAppAutoInit();
     console.log("Database & tables synced!");
 

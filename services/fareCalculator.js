@@ -1,17 +1,19 @@
-const { PricingSetting, PricingTier } = require("../models");
+const { PricingSetting } = require("../models");
 
 const DEFAULT_PRICING = {
   normal: {
-    baseFare: 2000,
-    pricePerKm: 500,
-    pricePerMinute: 0,
-    minimumFare: 3000,
+    baseFare: 10,
+    pricePerKm: 20,
+    pricePerMinute: 4,
+    minimumFare: 70,
+    roundingTo: 5,
   },
   vip: {
-    baseFare: 4000,
-    pricePerKm: 1000,
-    pricePerMinute: 0,
-    minimumFare: 5000,
+    baseFare: 10,
+    pricePerKm: 20,
+    pricePerMinute: 4,
+    minimumFare: 70,
+    roundingTo: 5,
   },
 };
 
@@ -32,10 +34,12 @@ const parseDuration = (value) => {
   return num;
 };
 
-const roundFareToNearest250 = (amount) => {
+const roundFareToNearest = (amount, nearest = 5) => {
   const num = parseFloat(amount);
   if (!Number.isFinite(num)) return null;
-  return Math.round(num / 250) * 250;
+  const step = parseFloat(nearest);
+  if (!Number.isFinite(step) || step <= 0) return num;
+  return Math.round(num / step) * step;
 };
 
 const calculateTierFare = (distanceKm, tiers) => {
@@ -69,9 +73,9 @@ const calculateTierFare = (distanceKm, tiers) => {
   return Number.isFinite(total) ? total : null;
 };
 
-const applyFinalAdjustments = (amount, minimumFare) => {
+const applyFinalAdjustments = (amount, minimumFare, roundingTo = 5) => {
   const beforeRound = Math.max(minimumFare, amount);
-  const rounded = roundFareToNearest250(beforeRound);
+  const rounded = roundFareToNearest(beforeRound, roundingTo);
   return rounded != null ? String(rounded) : null;
 };
 
@@ -80,7 +84,7 @@ const fallbackFare = (defaults, distance, duration) => {
     defaults.baseFare +
     distance * defaults.pricePerKm +
     duration * defaults.pricePerMinute;
-  return applyFinalAdjustments(total, defaults.minimumFare);
+  return applyFinalAdjustments(total, defaults.minimumFare, defaults.roundingTo);
 };
 
 const buildEstimatedFare = async ({ serviceType = "normal", distanceKm, durationMin, transaction } = {}) => {
@@ -98,34 +102,12 @@ const buildEstimatedFare = async ({ serviceType = "normal", distanceKm, duration
     });
 
     const baseFare = parseAmount(pricing?.baseFare, defaults.baseFare);
-    const perKmFallback = parseAmount(pricing?.pricePerKm, defaults.pricePerKm);
+    const perKm = parseAmount(pricing?.pricePerKm, defaults.pricePerKm);
     const perMinute = parseAmount(pricing?.pricePerMinute, defaults.pricePerMinute);
     const minimumFare = parseAmount(pricing?.minimumFare, defaults.minimumFare);
+    const roundingTo = parseAmount(pricing?.roundingTo, defaults.roundingTo);
 
-    const tiers = await PricingTier.findAll({
-      where: { serviceType },
-      order: [["fromKm", "ASC"]],
-      transaction,
-    });
-
-    let distanceFare = null;
-    if (tiers.length) {
-      const normalized = tiers.map((tier) => ({
-        fromKm: parseFloat(tier.fromKm),
-        toKm: tier.toKm == null ? null : parseFloat(tier.toKm),
-        pricePerKm: parseFloat(tier.pricePerKm),
-      }));
-      const tierFare = calculateTierFare(distance, normalized);
-      if (tierFare != null) {
-        distanceFare = tierFare;
-      }
-    }
-
-    if (distanceFare == null) {
-      distanceFare = distance * perKmFallback;
-    }
-
-    let total = baseFare + distanceFare + duration * perMinute;
+    let total = baseFare + distance * perKm + duration * perMinute;
 
     if (pricing?.surgeEnabled) {
       const surgeMultiplier = parseAmount(pricing?.surgeMultiplier, 1);
@@ -134,7 +116,7 @@ const buildEstimatedFare = async ({ serviceType = "normal", distanceKm, duration
       }
     }
 
-    return applyFinalAdjustments(total, minimumFare);
+    return applyFinalAdjustments(total, minimumFare, roundingTo);
   } catch (err) {
     console.error("[fareCalculator] buildEstimatedFare error", err.message);
     return fallbackFare(defaults, distance, duration);
@@ -143,7 +125,7 @@ const buildEstimatedFare = async ({ serviceType = "normal", distanceKm, duration
 
 module.exports = {
   DEFAULT_PRICING,
-  roundFareToNearest250,
+  roundFareToNearest,
   calculateTierFare,
   buildEstimatedFare,
 };

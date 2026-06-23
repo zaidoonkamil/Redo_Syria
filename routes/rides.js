@@ -16,15 +16,15 @@ const applyWalletTx = async ({ userId, type, amountCents, note, metadata, rideRe
   if (!user) throw Object.assign(new Error("user_not_found"), { code: "user_not_found" });
 
   const beforeCents = Math.round(Number(user.walletBalance || 0) * 100);
-  const afterCents = beforeCents + (type === "credit" ? amountCents : -amountCents);
-  if (afterCents < 0) throw Object.assign(new Error("wallet_insufficient_balance"), { code: "wallet_insufficient_balance" });
+  const debitCents = type === "debit" ? Math.min(amountCents, beforeCents) : amountCents;
+  const afterCents = beforeCents + (type === "credit" ? amountCents : -debitCents);
 
   user.walletBalance = centsToDecimal(afterCents);
   await user.save({ transaction: t });
 
   await WalletTransaction.create({
     user_id: user.id, type,
-    amount: centsToDecimal(amountCents),
+    amount: centsToDecimal(debitCents),
     balance_before: centsToDecimal(beforeCents),
     balance_after: centsToDecimal(afterCents),
     reference: rideRequestId ? `ride:${rideRequestId}` : null,
@@ -302,6 +302,10 @@ router.post("/ride-requests/:id/complete", authenticateToken, async (req, res) =
   try {
     const { paymentMethod, finalFare } = req.body;
     const rideId = Number(req.params.id);
+    if (paymentMethod !== "cash") {
+      await t.rollback();
+      return res.status(400).json({ error: "cash_payment_only" });
+    }
 
     // التحقق من المدخلات
     if (!["cash", "online"].includes(paymentMethod)) {
@@ -456,4 +460,4 @@ router.post("/ride-requests/:id/complete", authenticateToken, async (req, res) =
   }
 });
 
-module.exports = router;
+module.exports = router;

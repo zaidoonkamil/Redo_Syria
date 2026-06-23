@@ -4,7 +4,7 @@ const jwt = require("jsonwebtoken");
 const multer = require("multer");
 const { Op } = require("sequelize");
 const sequelize = require("../config/db");
-const { User, UserDevice, OtpCode, PasswordResetOtp, WalletTransaction } = require("../models");
+const { User, UserDevice, OtpCode, PasswordResetOtp, WalletTransaction, RechargeCode } = require("../models");
 const uploadImage = require("../middlewares/uploads");
 const router = express.Router();
 const upload = multer();
@@ -316,6 +316,7 @@ const parseAmountToCents = (value) => {
 };
 
 const centsToDecimal = (cents) => (cents / 100).toFixed(2);
+const normalizeRechargeCode = (value) => String(value || "").replace(/[\s-]+/g, "").toUpperCase();
 
 // type: credit | debit
 const applyWalletTransaction = async ({ userId, type, amountCents, reference, note, metadata,
@@ -333,6 +334,11 @@ const applyWalletTransaction = async ({ userId, type, amountCents, reference, no
     if (!user) {
       const err = new Error("wallet_user_not_found");
       err.code = "wallet_user_not_found";
+      throw err;
+    }
+    if (user.role !== "driver") {
+      const err = new Error("driver_wallet_only");
+      err.code = "driver_wallet_only";
       throw err;
     }
 
@@ -831,8 +837,115 @@ router.patch("/users/:id/status", requireAdmin, upload.none(), async (req, res) 
 
 
 // جلب رصيد المحفظة الحالي للمستخدم مع التأكد من توثيق الطلب باستخدام التوكن
+router.post("/wallet/redeem-code", authenticateToken, upload.none(), async (req, res) => {
+  try {
+    const rawCode = req.body.code || req.body.rechargeCode;
+    const codeText = normalizeRechargeCode(rawCode);
+    if (!codeText) {
+      return res.status(400).json({ error: "code is required" });
+    }
+
+    const result = await sequelize.transaction(async (t) => {
+      const driver = await User.findByPk(req.user.id, {
+        transaction: t,
+        lock: t.LOCK.UPDATE,
+      });
+
+      if (!driver) {
+        const err = new Error("driver_not_found");
+        err.code = "driver_not_found";
+        throw err;
+      }
+
+      if (driver.role !== "driver") {
+        const err = new Error("driver_only");
+        err.code = "driver_only";
+        throw err;
+      }
+
+      const rechargeCode = await RechargeCode.findOne({
+        where: { code: codeText },
+        transaction: t,
+        lock: t.LOCK.UPDATE,
+      });
+
+      if (!rechargeCode) {
+        const err = new Error("recharge_code_not_found");
+        err.code = "recharge_code_not_found";
+        throw err;
+      }
+
+      if (rechargeCode.status !== "active") {
+        const err = new Error(`recharge_code_${rechargeCode.status}`);
+        err.code = `recharge_code_${rechargeCode.status}`;
+        throw err;
+      }
+
+      const amountCents = Math.round(Number(rechargeCode.amount || 0) * 100);
+      if (amountCents <= 0) {
+        const err = new Error("invalid_recharge_amount");
+        err.code = "invalid_recharge_amount";
+        throw err;
+      }
+
+      const beforeCents = Math.round(Number(driver.walletBalance || 0) * 100);
+      const afterCents = beforeCents + amountCents;
+      driver.walletBalance = centsToDecimal(afterCents);
+      await driver.save({ transaction: t });
+
+      rechargeCode.status = "redeemed";
+      rechargeCode.redeemedByDriverId = driver.id;
+      rechargeCode.redeemedAt = new Date();
+      await rechargeCode.save({ transaction: t });
+
+      const tx = await WalletTransaction.create(
+        {
+          user_id: driver.id,
+          type: "credit",
+          amount: centsToDecimal(amountCents),
+          balance_before: centsToDecimal(beforeCents),
+          balance_after: centsToDecimal(afterCents),
+          reference: `recharge_code:${rechargeCode.code}`,
+          note: "Driver wallet recharge code",
+          metadata: { source: "recharge_code", codeId: rechargeCode.id, code: rechargeCode.code },
+          created_by: rechargeCode.createdByAdminId || null,
+        },
+        { transaction: t }
+      );
+
+      return { driver, rechargeCode, tx };
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "wallet_recharged",
+      wallet: {
+        userId: result.driver.id,
+        balance: Number(result.driver.walletBalance || 0),
+      },
+      code: {
+        id: result.rechargeCode.id,
+        code: result.rechargeCode.code,
+        amount: Number(result.rechargeCode.amount || 0),
+        status: result.rechargeCode.status,
+        redeemedAt: result.rechargeCode.redeemedAt,
+      },
+      transaction: result.tx,
+    });
+  } catch (err) {
+    if (err.code === "driver_not_found") return res.status(404).json({ error: "driver_not_found" });
+    if (err.code === "driver_only") return res.status(403).json({ error: "driver_wallet_only" });
+    if (err.code === "recharge_code_not_found") return res.status(404).json({ error: "invalid_recharge_code" });
+    if (err.code === "recharge_code_redeemed") return res.status(400).json({ error: "recharge_code_already_used" });
+    if (err.code === "recharge_code_cancelled") return res.status(400).json({ error: "recharge_code_cancelled" });
+    console.error("Error redeeming recharge code:", err);
+    return res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
 router.get("/wallet", authenticateToken, async (req, res) => {
   try {
+    if (req.user.role !== "driver") return res.status(403).json({ error: "driver_wallet_only" });
     const user = await User.findByPk(req.user.id, {
       attributes: ["id", "name", "phone", "role", "walletBalance"],
     });
@@ -854,6 +967,7 @@ router.get("/wallet", authenticateToken, async (req, res) => {
 // جلب سجل معاملات المحفظة للمستخدم مع دعم التصفية والبحث والتفاصيل، مع التأكد من توثيق الطلب باستخدام التوكن
 router.get("/wallet/transactions", authenticateToken, async (req, res) => {
   try {
+    if (req.user.role !== "driver") return res.status(403).json({ error: "driver_wallet_only" });
     const page = Math.max(parseInt(req.query.page || "1", 10), 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit || "20", 10), 1), 100);
     const offset = (page - 1) * limit;
@@ -892,6 +1006,7 @@ router.get("/wallet/transactions", authenticateToken, async (req, res) => {
 // شحن المحفظة أو خصم الرصيد من قبل الأدمن مع التأكد من توثيق الطلب باستخدام التوكن
 router.post("/admin/wallet/topup", requireAdmin, upload.none(), async (req, res) => {
   try {
+    return res.status(410).json({ error: "use_recharge_codes" });
     const userId = Number(req.body.userId);
     const amountCents = parseAmountToCents(req.body.amount);
     const { reference, note } = req.body;
