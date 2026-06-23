@@ -1,14 +1,27 @@
 const path = require("path");
 const fs = require("fs");
-const qrcode = require("qrcode");
-const P = require("pino");
-const {
-  DisconnectReason,
-  Browsers,
-  default: makeWASocket,
-  fetchLatestBaileysVersion,
-  useMultiFileAuthState,
-} = require("@whiskeysockets/baileys");
+let qrcode = null;
+let P = null;
+let DisconnectReason = null;
+let Browsers = null;
+let makeWASocket = null;
+let fetchLatestBaileysVersion = null;
+let useMultiFileAuthState = null;
+let whatsappDependencyError = null;
+
+try {
+  qrcode = require("qrcode");
+  P = require("pino");
+  ({
+    DisconnectReason,
+    Browsers,
+    default: makeWASocket,
+    fetchLatestBaileysVersion,
+    useMultiFileAuthState,
+  } = require("@whiskeysockets/baileys"));
+} catch (error) {
+  whatsappDependencyError = error;
+}
 
 const SESSION_PATH = process.env.WHATSAPP_SESSION_PATH
   ? path.resolve(process.env.WHATSAPP_SESSION_PATH)
@@ -78,7 +91,7 @@ function normalizeDisconnectReason(error) {
 }
 
 function shouldReconnect(error) {
-  return normalizeDisconnectReason(error) !== DisconnectReason.loggedOut;
+  return normalizeDisconnectReason(error) !== DisconnectReason?.loggedOut;
 }
 
 function scheduleReconnect(reason = "unknown") {
@@ -134,6 +147,7 @@ function getStatus() {
     hasQr: Boolean(latestQrImage),
     connectedNumber,
     lastError: latestError,
+    dependencyMissing: Boolean(whatsappDependencyError),
   };
 }
 
@@ -165,8 +179,20 @@ function waitForClientReady(timeoutMs = READY_WAIT_TIMEOUT_MS) {
 }
 
 async function buildQrImage(qrText) {
+  if (!qrcode) {
+    throw buildWhatsAppDependencyError();
+  }
   latestQrText = qrText;
   latestQrImage = await qrcode.toDataURL(qrText);
+}
+
+function buildWhatsAppDependencyError() {
+  const missing = whatsappDependencyError?.code === "MODULE_NOT_FOUND"
+    ? whatsappDependencyError.message
+    : whatsappDependencyError?.message || "WhatsApp dependency is missing";
+  return new Error(
+    `${missing}. Run: npm install pino qrcode @whiskeysockets/baileys`
+  );
 }
 
 function bindSocketEvents(instance) {
@@ -235,6 +261,10 @@ function bindSocketEvents(instance) {
 }
 
 async function buildSocket() {
+  if (whatsappDependencyError) {
+    throw buildWhatsAppDependencyError();
+  }
+
   ensureSessionPath();
   const auth = await useMultiFileAuthState(SESSION_DIR);
   authState = auth.state;
@@ -373,6 +403,12 @@ async function logoutWhatsApp() {
 
 function startWhatsAppAutoInit() {
   if (!AUTO_INIT) {
+    return;
+  }
+  if (whatsappDependencyError) {
+    connectionStatus = "failed";
+    latestError = buildWhatsAppDependencyError().message;
+    console.warn("[WhatsApp] disabled:", latestError);
     return;
   }
 
